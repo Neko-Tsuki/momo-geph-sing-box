@@ -1,0 +1,164 @@
+name: Build and publish Momo Loyalsoldier rule sets
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - ".github/workflows/**"
+      - "loyalsoldier-rule-builder/**"
+      - "momofake-1.13x-momo-geph58.json"
+  schedule:
+    # Daily at 20:15 UTC = 04:15 China Standard Time
+    - cron: "15 20 * * *"
+
+permissions:
+  contents: write
+
+concurrency:
+  group: momo-rule-set-build
+  cancel-in-progress: false
+
+env:
+  SING_BOX_VERSION: "1.13.21"
+
+jobs:
+  build-and-release:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y jq python3
+
+      - name: Download pinned sing-box compiler
+        shell: bash
+        run: |
+          set -euo pipefail
+          api="https://api.github.com/repos/SagerNet/sing-box/releases/tags/v${SING_BOX_VERSION}"
+          curl -fsSL "$api" -o "$RUNNER_TEMP/sing-box-release.json"
+          url="$(jq -r '.assets[] | select(.name | test("linux-amd64.*tar.gz$")) | .browser_download_url' \
+            "$RUNNER_TEMP/sing-box-release.json" | head -n1)"
+          if [[ -z "$url" || "$url" == "null" ]]; then
+            echo "No Linux amd64 tar.gz asset found for sing-box ${SING_BOX_VERSION}" >&2
+            jq -r '.assets[].name' "$RUNNER_TEMP/sing-box-release.json" >&2
+            exit 1
+          fi
+          mkdir -p "$RUNNER_TEMP/sing-box"
+          curl -fL --retry 3 "$url" -o "$RUNNER_TEMP/sing-box.tar.gz"
+          tar -xzf "$RUNNER_TEMP/sing-box.tar.gz" -C "$RUNNER_TEMP/sing-box"
+          bin="$(find "$RUNNER_TEMP/sing-box" -type f -name sing-box -perm -u+x | head -n1)"
+          test -n "$bin"
+          install -m 0755 "$bin" "$RUNNER_TEMP/sing-box-bin"
+          "$RUNNER_TEMP/sing-box-bin" version
+
+      - name: Build 20 local SRS rule sets
+        shell: bash
+        run: |
+          set -euo pipefail
+          python3 loyalsoldier-rule-builder/build_rules.py \
+            --sing-box "$RUNNER_TEMP/sing-box-bin" \
+            --out-dir "$GITHUB_WORKSPACE/rule_set"
+          count="$(find rule_set -maxdepth 1 -type f -name '*.srs' | wc -l)"
+          test "$count" -eq 20
+          find rule_set -maxdepth 1 -type f -name '*.srs' -size +0c -print | sort
+
+      - name: Validate config and rule-set references
+        run: |
+          python3 - <<'PY'
+          import json, pathlib, re
+          cfg = json.loads(pathlib.Path("momofake-1.13x-momo-geph58.json").read_text())
+          expected = {
+            "geosite-fakeipfilter", "geosite-ai", "geosite-youtube", "geosite-google",
+            "geosite-github", "geosite-onedrive", "geosite-microsoft", "geosite-apple",
+            "geosite-telegram", "geosite-tiktok", "geosite-netflix", "geosite-paypal",
+            "geosite-steam", "geosite-steamcn", "geosite-!cn", "geosite-cn",
+            "geoip-cn", "geoip-google", "geoip-telegram", "geoip-netflix"
+          }
+          rule_sets = cfg.get("route", {}).get("rule_set", [])
+          actual = {x["tag"] for x in rule_sets}
+          assert actual == expected, f"rule-set tag mismatch: missing={expected-actual}, extra={actual-expected}"
+          for item in rule_sets:
+              name = item["tag"] + ".srs"
+              p = pathlib.Path("rule_set") / name
+              assert p.is_file() and p.stat().st_size > 0, f"missing or empty: {name}"
+              assert item.get("format") == "binary" and item.get("type") == "local"
+          text = json.dumps(cfg)
+          assert "127.0.0.1" in text and "9909" in text, "Geph SOCKS5 endpoint not found"
+          print("Config references all 20 generated SRS files; Geph endpoint is present.")
+          PY
+
+      - name: Package rule sets and create checksum
+        id: package
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          python3 - <<'PY'
+          import pathlib, tarfile
+          files = sorted(pathlib.Path("rule_set").glob("*.srs"))
+          assert len(files) == 20
+          with tarfile.open("dist/rule-set.tar.gz", "w:gz") as tar:
+              for p in files:
+                  tar.add(p, arcname=p.name, recursive=False)
+          PY
+          sha="$(sha256sum dist/rule-set.tar.gz | awk '{print $1}')"
+          asset="rule-set-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}.tar.gz"
+          cp dist/rule-set.tar.gz "dist/$asset"
+          printf 'asset=%s\nsha256=%s\nsing_box_version=%s\ncommit=%s\n' \
+            "$asset" "$sha" "$SING_BOX_VERSION" "$GITHUB_SHA" > dist/latest.txt
+          echo "asset=$asset" >> "$GITHUB_OUTPUT"
+          echo "sha256=$sha" >> "$GITHUB_OUTPUT"
+          cp momofake-1.13x-momo-geph58.json dist/
+
+      - name: Upload workflow artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: momo-geph58-build-${{ github.run_number }}
+          path: |
+            dist/*.tar.gz
+            dist/latest.txt
+            dist/momofake-1.13x-momo-geph58.json
+          if-no-files-found: error
+          retention-days: 30
+
+      - name: Create rolling Release if missing
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          if ! gh release view rules-latest >/dev/null 2>&1; then
+            gh release create rules-latest \
+              --title "Momo Geph rule sets (latest)" \
+              --notes "Rolling release. OpenWrt updater reads latest.txt first, then downloads the versioned archive and verifies SHA-256."
+          fi
+
+      - name: Publish versioned archive
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload rules-latest "dist/${{ steps.package.outputs.asset }}"
+
+      - name: Update latest pointer (publish this last)
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload rules-latest dist/latest.txt --clobber
+
+      - name: Publish config JSON
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh release upload rules-latest dist/momofake-1.13x-momo-geph58.json --clobber
+
+      - name: Summary
+        run: |
+          {
+            echo "## Release published"
+            echo "- Release tag: \`rules-latest\`"
+            echo "- Rule archive: \`${{ steps.package.outputs.asset }}\`"
+            echo "- SHA-256: \`${{ steps.package.outputs.sha256 }}\`"
+            echo "- OpenWrt pulls this release; no inbound SSH is required."
+          } >> "$GITHUB_STEP_SUMMARY"

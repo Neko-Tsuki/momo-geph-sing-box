@@ -1,0 +1,15 @@
+# GitHub repository must be PUBLIC for unauthenticated OpenWrt downloads.
+# Format: owner/repository
+GITHUB_REPO="YOUR_GITHUB_USERNAME/momo-geph-sing-box"
+RELEASE_TAG="rules-latest"
+
+# Must match the absolute paths in momofake-1.13x-momo-geph58.json.
+DEST_DIR="/etc/momo/rule_set"
+
+# Stores last installed archive checksum; keep outside DEST_DIR because updater swaps that directory.
+STATE_FILE="/etc/momo/.momo-rule-set-sha256"
+
+# Optional: set the actual init.d service name only after confirming it on your router.
+# Example: RESTART_SERVICE="momo"
+# Empty means install only; no automatic restart.
+RESTART_SERVICE=""
